@@ -19,6 +19,9 @@ OPT_EPOCH = 5           # Number of updates using collected trajectories
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+def to_np(t):
+    return t.cpu().detach().numpy()
+
 class PPOAgent():
     def __init__(self, state_size, action_size, seed, 
                  hidden_layers, opt_epoch = OPT_EPOCH, use_gae = True):
@@ -87,8 +90,8 @@ class PPOAgent():
             # no gradient propagation is needed
             # so we move it to the cpu
             states_input = torch.tensor(states, dtype=torch.float, device=device)
-            predictions = self.network(states_input).squeeze().cpu().detach().numpy()
-            actions = predictions['a']
+            predictions = self.network(states_input)
+            actions = to_np(predictions['a'])
             actions = np.clip(actions, -1, 1)
             env_info = envs.step(actions)[brain_name]
             next_states = env_info.vector_observations
@@ -98,7 +101,7 @@ class PPOAgent():
             # store the result
             state_list.append(states)
             reward_list.append(rewards)
-            log_prob_list.append(predictions['log_pi_a'])
+            log_prob_list.append(to_np(predictions['log_pi_a']))
             action_list.append(actions)
             done_list.append(dones)
             prediction_list.append(predictions)
@@ -107,17 +110,17 @@ class PPOAgent():
         
             # stop if any of the trajectories is done
             # we want all the lists to be retangular
-            if dones.any():
+            if np.stack(dones).any():
                 break
 
         # store one more step's prediction
         states_input = torch.tensor(states, dtype=torch.float, device=device)
-        predictions = self.network(states_input).squeeze().cpu().detach().numpy()
+        predictions = self.network(states_input)
         prediction_list.append(predictions)
 
         # return pi_theta, states, actions, rewards, probability
-        return log_prob_list, state_list, action_list, \
-            reward_list, done_list, prediction_list
+        return np.stack(log_prob_list), np.stack(state_list), np.stack(action_list), \
+            np.stack(reward_list), np.stack(done_list), prediction_list
 
     # clipped surrogate function
     # similar as -policy_loss for REINFORCE, but for PPO
@@ -150,8 +153,8 @@ class PPOAgent():
             tmp_adv = np.zeros(log_old_probs.shape[1])
 
             for i in reversed(range(T)):
-                td_error = rewards[i, :] + discount * dones[i, :] * np.array(predictions[i+1]['v']) - \
-                    np.array(predictions[i]['v'])
+                td_error = rewards[i, :] + discount * dones[i, :] * to_np(predictions[i+1]['v']) - \
+                    to_np(predictions[i]['v'])
                 tmp_adv = tmp_adv * lamda * discount * dones[i, :] + td_error
                 advantages[i] = tmp_adv
     
@@ -161,17 +164,19 @@ class PPOAgent():
         adv_normalized = (advantages - mean[:, np.newaxis]) / std[:, np.newaxis]
     
         # convert everything into pytorch tensors and move to gpu if available
+        state_count = (states.shape[0], states.shape[1])
+
         log_old_probs = torch.tensor(log_old_probs, dtype=torch.float, device=device)
         adv = torch.tensor(adv_normalized, dtype=torch.float, device=device)
-        rewards_future = torch.tensor(rewards_future, dtype=torch.float, device=device)
+        rewards_future = torch.tensor(rewards_future.copy(), dtype=torch.float, device=device)
         states = torch.tensor(states, dtype=torch.float, device=device)
         actions = torch.tensor(actions, dtype=torch.float, device=device)
 
         # convert states to policy (or probability)
-        states_input = states.view(-1, states.shape[-1])
-        actions_input = actions.view(-1, actions.shape[-1])
+        states_input = states.view(-1, self.state_size)
+        actions_input = actions.view(-1, self.action_size)
         new_predictions = self.network(states_input, actions_input)
-        log_new_probs = new_predictions['log_pi_a'].view(states.shape[:-1])
+        log_new_probs = new_predictions['log_pi_a'].view(state_count)
     
         # ratio for clipping
         ratio = (log_new_probs - log_old_probs).exp()
@@ -181,14 +186,14 @@ class PPOAgent():
         clipped_surrogate = torch.min(ratio*adv, clip*adv)
 
         # include entropy as a regularization term
-        entropy = new_predictions['entropy'].view(states.shape[:-1])
+        entropy = new_predictions['entropy'].view(state_count)
 
         # policy/actor loss
         policy_loss = -clipped_surrogate.mean() - beta * entropy.mean()
 
         # value/cirtic loss, if use GAE
         if self.use_gae:
-            value_loss = 0.5 * (rewards_future - new_predictions['v'].view(states.shape[:-1])).pow(2).mean()
+            value_loss = 0.5 * (rewards_future - new_predictions['v'].view(state_count)).pow(2).mean()
             loss = policy_loss + value_loss
         else:
             loss = policy_loss
@@ -208,3 +213,5 @@ class PPOAgent():
             L.backward()
             self.optimizer.step()
             del L
+
+        return rewards
