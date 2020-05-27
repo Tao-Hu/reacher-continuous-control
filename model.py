@@ -30,9 +30,12 @@ class ActorCriticNetwork(nn.Module):
         dist = torch.distributions.Normal(mean, F.softplus(self.std))
         if action is None:
             action = dist.sample()
-        log_prob = dist.log_prob(action).sum(-1).unsqueeze(-1)
-        entropy = dist.entropy().sum(-1).unsqueeze(-1)
-        v = self.fc_critic(state)
+        # log_prob = dist.log_prob(action).sum(-1).unsqueeze(-1)
+        log_prob = dist.log_prob(action).sum(-1)
+        # entropy = dist.entropy().sum(-1).unsqueeze(-1)
+        entropy = dist.entropy().sum(-1)
+        # v = self.fc_critic(state)
+        v = self.fc_critic(state).squeeze()
         return {'a': action, 'log_pi_a': log_prob, 'entropy': entropy, 'v': v}
 
 
@@ -63,6 +66,8 @@ class PolicyNetwork(nn.Module):
         dist = torch.distributions.Normal(mean, F.softplus(self.std))
         if action is None:
             action = dist.sample()
-        log_prob = dist.log_prob(action).sum(-1).unsqueeze(-1)
-        entropy = dist.entropy().sum(-1).unsqueeze(-1)
+        # log_prob = dist.log_prob(action).sum(-1).unsqueeze(-1)
+        log_prob = dist.log_prob(action).sum(-1)
+        # entropy = dist.entropy().sum(-1).unsqueeze(-1)
+        entropy = dist.entropy().sum(-1)
         return {'a': action, 'log_pi_a': log_prob, 'entropy': entropy}
