@@ -1,217 +1,155 @@
-import numpy as np
-import random
-
-from model import ActorCriticNetwork, PolicyNetwork
-
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import numpy as np
+import random
+from torch.utils.data import DataLoader
+from collections import namedtuple
+
+from ActorCriticNetwork import ActorCriticNetwork
 
 N = 20                  # nummber of parallel agents
 BATCH_SIZE = 64         # minibatch size
 GAMMA = 0.99            # discount factor
-LR = 5e-4               # learning rate
-EPSILON = 0.1           # Clip hyperparameter for PPO
-ROLLOUT_LEN = 1000      # Rollout length if use GAE
+LR = 1e-4               # learning rate
+EPSILON = 0.2           # Clip hyperparameter for PPO
+ROLLOUT_LEN = 1024      # Rollout length if use GAE
 LAMDA = 0.95            # lambda-return for GAE
-BETA = 0.01             # Coefficient for entropy loss
+BETA = 0.001            # Coefficient for entropy loss
 OPT_EPOCH = 5           # Number of updates using collected trajectories
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+trajectory = namedtuple('Trajectory', field_names=['state', 'action', 'reward', 'mask', 'log_prob', 'value'])
 
-def to_np(t):
-    return t.cpu().detach().numpy()
+class Batcher():
+    def __init__(self, states, actions, old_log_probs, returns, advantages):
+        self.states = states
+        self.actions = actions
+        self.old_log_probs = old_log_probs
+        self.returns = returns
+        self.advantages = advantages
+      
+    def __len__(self):
+        return len(self.returns)
+   
+    def __getitem__(self, index):
+        return (self.states[index], 
+                self.actions[index], 
+                self.old_log_probs[index], 
+                self.returns[index],
+                self.advantages[index]
+               )
+
+def calculate_gae_returns(trajectories, num_agents, gamma=GAMMA, gae_tau=LAMDA):
+    processed_trajectories = [None] * (len(trajectories)-1)
+    gae = 0.
+   
+    for i in reversed(range(len(trajectories) - 1)):
+        state, action, reward, mask, log_prob, value = trajectories[i] 
+        next_value = trajectories[i+1].value
+
+        delta = reward + gamma * next_value * mask - value
+        gae = delta + gamma * gae_tau * mask * gae
+        discounted_return = gae + value
+        advantage = discounted_return - value
+      
+        processed_trajectories[i] = (state, action, log_prob, 
+                                     discounted_return, advantage)
+      
+    return processed_trajectories
 
 class PPOAgent():
-    def __init__(self, state_size, action_size, seed, 
-                 hidden_layers, opt_epoch = OPT_EPOCH, use_gae = True):
-        """Initialize an PPO Agent object.
-
-           Arguments
-           ---------
-           state_size (int): Dimension of state
-           action_size (int): Total number of possible actions
-           seed (int): Random seed
-           hidden_layers (list): List of integers, each element represents for the size of a hidden layer
-           opt_epoch (int): Nummber of updates using the collected trajectories
-           use_gae (logic): Indicator of using GAE, True or False
-        """
+    def __init__(self, state_size, action_size, hidden_layers, 
+                 opt_epoch = OPT_EPOCH, batch_size = BATCH_SIZE):
         self.state_size = state_size
         self.action_size = action_size
         self.opt_epoch = opt_epoch
-        self.use_gae = use_gae
-        self.seed = random.seed(seed)
+        self.batch_size = batch_size
+        self.model = ActorCriticNetwork(state_size, action_size, hidden_layers)
+        self.optimizer = optim.Adam(self.model.parameters(), lr = LR)
 
-        # networks
-        if use_gae:
-            self.network = ActorCriticNetwork(state_size, action_size, seed, hidden_layers).to(device)
-        else:
-            self.network = PolicyNetwork(state_size, action_size, seed, hidden_layers).to(device)
-        self.optimizer = optim.Adam(self.network.parameters(), lr = LR)
+    def act(self, env, brain_name, state):
+        # Sample an action from current policy
+        value, dist = self.model(torch.FloatTensor(state))
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
 
-    # collect trajectories for a parallelized parallelEnv object
-    def collect_trajectories(self, envs, brain_name, 
-                             tmax=ROLLOUT_LEN, nrand=5, n_agents = N):
-        """Collect trajectories.
+        # Convert to numpy
+        log_prob = log_prob.detach().cpu().numpy()
+        value = value.detach().cpu().numpy()
+        action = action.detach().cpu().numpy()
+   
+        # Act and see response
+        env_info = env.step(np.clip(action, -1, 1))[brain_name]
+        next_state = env_info.vector_observations
+        reward = np.array(env_info.rewards).reshape(-1, 1)
+        done = np.array(env_info.local_done)
+        mask = (1-done).reshape(-1, 1)
+   
+        t = trajectory(state, action, reward, mask, log_prob, value)
+        return next_state, done, t
 
-           Arguments
-           ---------
-           envs: Environment
-           brain_name: brain name of given environment
-           tmax: Maximum length of collected trajectories
-           nrand: Random steps performed before collecting trajectories
-           n_agents: Number of parallel agents in the environment
-        """
-    
-        # number of parallel instances
-        n = n_agents
-
-        #initialize returning lists and start the game!
-        state_list = []
-        reward_list = []
-        log_prob_list = []
-        action_list = []
-        done_list = []
-        prediction_list = []
-
+    def collect_trajectories(self, env, brain_name):
         # reset environment
-        env_info = envs.reset(train_mode=True)[brain_name]
-    
-        # perform nrand random steps
-        for _ in range(nrand):
-            actions = np.random.randn(n, self.action_size)
-            actions = np.clip(actions, -1, 1)
-            env_info = envs.step(actions)[brain_name]
+        env_info = env.reset(train_mode=True)[brain_name]
+        state = env_info.vector_observations
+        done = env_info.local_done
 
-        states = env_info.vector_observations
-    
-        for _ in range(tmax):
-            # probs will only be used as the pi_old
-            # no gradient propagation is needed
-            # so we move it to the cpu
-            states_input = torch.tensor(states, dtype=torch.float, device=device)
-            predictions = self.network(states_input)
-            actions = to_np(predictions['a'])
-            actions = np.clip(actions, -1, 1)
-            env_info = envs.step(actions)[brain_name]
-            next_states = env_info.vector_observations
-            rewards = env_info.rewards
-            dones = env_info.local_done
-        
-            # store the result
-            state_list.append(states)
-            reward_list.append(rewards)
-            log_prob_list.append(to_np(predictions['log_pi_a']))
-            action_list.append(actions)
-            done_list.append(dones)
-            prediction_list.append(predictions)
+        # Collect trajectories
+        episode_score = 0.
+        trajectories = []
 
-            states = next_states
-        
-            # stop if any of the trajectories is done
-            # we want all the lists to be retangular
-            if np.stack(dones).any():
-                break
+        while not any(done):
+            next_state, done, t = self.act(env, brain_name, state)
+            trajectories.append(t)
+            episode_score += t.reward.mean()
+            state = next_state
+   
+        # Obtain final value from terminal state and store it
+        next_value, _ = self.model(torch.FloatTensor(state))
+        next_value = next_value.detach().cpu().numpy()
+        terminal_trajectory = trajectory(state, None, None, None, None, next_value)
+        trajectories.append(terminal_trajectory)
 
-        # store one more step's prediction
-        states_input = torch.tensor(states, dtype=torch.float, device=device)
-        predictions = self.network(states_input)
-        prediction_list.append(predictions)
+        return trajectories, episode_score
 
-        # return pi_theta, states, actions, rewards, probability
-        return np.stack(log_prob_list), np.stack(state_list), np.stack(action_list), \
-            np.stack(reward_list), np.stack(done_list), prediction_list
+    def update(self, trajectories):
+        # calculate accumulated discounted returns and advantages
+        p_trajectories = calculate_gae_returns(trajectories, num_agents=N)
+        states, actions, old_log_probs, returns, advantages = \
+            map(torch.FloatTensor, zip(*p_trajectories))
+        advantages = (advantages - advantages.mean())  / (advantages.std() + 1e-7)
 
-    # clipped surrogate function
-    # similar as -policy_loss for REINFORCE, but for PPO
-    def clipped_surrogate(self, log_old_probs, states, actions, rewards, dones, predictions,
-                          discount = GAMMA, lamda = LAMDA, epsilon = EPSILON, beta = BETA):
-        """Clipped surrogate function.
+        # Divide collected trajectories into random batches
+        batcher = DataLoader(
+            Batcher(states, actions, old_log_probs, returns, advantages),
+            batch_size = self.batch_size,
+            shuffle = True)
 
-           Arguments
-           ---------
-           log_old_probs: Log probability of old policy, array with dim rollout_length * number_of_workers
-           states: States, array with dim rollout_length * number_of_workers * state_size
-           actions: Actions, array with dim rollout_length * number_of_workers * action_size
-           rewards: Rewards, array with dim rollout_length * number_of_workers
-           dones: Indicator of the end of an episode, array with dim rollout_length * number_of_workers
-           predictions: Outputs from agent's network, list of dictionary with length (rollout_length + 1)
-        """
+        # training
+        self.model.train()
+        self.learn(batcher)
 
-        # calculate returns
-        discount_seq = discount**np.arange(len(rewards))
-        rewards_discounted = np.asarray(rewards)*discount_seq[:, np.newaxis]
-    
-        rewards_future = rewards_discounted[::-1].cumsum(axis = 0)[::-1]
-
-        # calculate advantage functions
-        if not self.use_gae:
-            advantages = rewards_future
-        else:
-            T = log_old_probs.shape[0]
-            advantages = np.zeros_like(log_old_probs)
-            tmp_adv = np.zeros(log_old_probs.shape[1])
-
-            for i in reversed(range(T)):
-                td_error = rewards[i, :] + discount * dones[i, :] * to_np(predictions[i+1]['v']) - \
-                    to_np(predictions[i]['v'])
-                tmp_adv = tmp_adv * lamda * discount * dones[i, :] + td_error
-                advantages[i] = tmp_adv
-    
-        mean = np.mean(advantages, axis = 1)
-        std = np.std(advantages, axis = 1) + 1.0e-10
-
-        adv_normalized = (advantages - mean[:, np.newaxis]) / std[:, np.newaxis]
-    
-        # convert everything into pytorch tensors and move to gpu if available
-        state_count = (states.shape[0], states.shape[1])
-
-        log_old_probs = torch.tensor(log_old_probs, dtype=torch.float, device=device)
-        adv = torch.tensor(adv_normalized, dtype=torch.float, device=device)
-        rewards_future = torch.tensor(rewards_future.copy(), dtype=torch.float, device=device)
-        states = torch.tensor(states, dtype=torch.float, device=device)
-        actions = torch.tensor(actions, dtype=torch.float, device=device)
-
-        # convert states to policy (or probability)
-        states_input = states.view(-1, self.state_size)
-        actions_input = actions.view(-1, self.action_size)
-        new_predictions = self.network(states_input, actions_input)
-        log_new_probs = new_predictions['log_pi_a'].view(state_count)
-    
-        # ratio for clipping
-        ratio = (log_new_probs - log_old_probs).exp()
-
-        # clipped function
-        clip = torch.clamp(ratio, 1-epsilon, 1+epsilon)
-        clipped_surrogate = torch.min(ratio*adv, clip*adv)
-
-        # include entropy as a regularization term
-        entropy = new_predictions['entropy'].view(state_count)
-
-        # policy/actor loss
-        policy_loss = -clipped_surrogate.mean() - beta * entropy.mean()
-
-        # value/cirtic loss, if use GAE
-        if self.use_gae:
-            value_loss = 0.5 * (rewards_future - new_predictions['v'].view(state_count)).pow(2).mean()
-            loss = policy_loss + value_loss
-        else:
-            loss = policy_loss
-
-        # this returns an average of all the loss entries
-        return loss
-
-    def step(self, envs, brain_name):
-        # first, collect trajectories
-        log_old_probs, states, actions, rewards, dones, predictions = \
-            self.collect_trajectories(envs, brain_name)
-
-        # update parameters using collected trajectories
+    def learn(self, batcher, epsilon_clip=EPSILON, beta=BETA, gradient_clip=10):
         for _ in range(self.opt_epoch):
-            L = self.clipped_surrogate(log_old_probs, states, actions, rewards, dones, predictions)
-            self.optimizer.zero_grad()
-            L.backward()
-            self.optimizer.step()
-            del L
+            for states, actions, old_log_probs, returns, advantages in batcher:
+                # Get updated values from policy
+                values, dist = self.model(states)
+                new_log_probs = dist.log_prob(actions)
+                entropy = dist.entropy()
 
-        return rewards
+                # Calculate ratio and clip, so that learning doesn't change new policy much from old 
+                ratio = (new_log_probs - old_log_probs).exp()
+                clip = torch.clamp(ratio, 1 - epsilon_clip, 1 + epsilon_clip)
+                clipped_surrogate = torch.min(ratio * advantages, clip * advantages)
+
+                # Get losses
+                actor_loss = -torch.mean(clipped_surrogate) - beta * entropy.mean()
+                critic_loss = torch.mean(torch.square((returns - values)))
+                losses = critic_loss * 1.0 + actor_loss
+
+                # Do the optimizer step
+                self.optimizer.zero_grad()
+                losses.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), gradient_clip)
+                self.optimizer.step()
